@@ -341,7 +341,7 @@
    Everything (list, ratings, round progress, tiers) lives in this
    browser's localStorage. The only network calls are stateless lookups:
    Steam store search, Wikidata/Wikipedia search + summaries, cover art,
-   and YouTube embeds — the same free, no-key sources as the hosted app.
+   playthrough-video lookup via the Cloudflare Worker, and YouTube embeds.
    ===================================================================== */
 
 const STARTER_GAMES = JSON.parse(document.getElementById("starter-data").textContent);
@@ -724,8 +724,8 @@ async function fetchJson(url, timeoutMs, headers) {
   } catch { return null; } finally { clearTimeout(timer); }
 }
 /* Browser-safe JSON fetch for hosts that send no CORS headers (Steam).
-   Tries a direct fetch first, then the same public relays already used
-   for the longplay lookup — allorigins, then corsproxy.io. Without this,
+   Tries a direct fetch first, then public relays — allorigins, then
+   corsproxy.io. Without this,
    every Steam request fails silently in a browser (no
    Access-Control-Allow-Origin), so Steam-only covers like Undertale's
    capsule never arrived in the local copy. */
@@ -1278,44 +1278,20 @@ async function searchAll(term, perSource, fast) {
   }
   return results;
 }
-/* Playthrough videos — no-key lookup, raced across independent
-   sources, with per-source diagnostics.
-   History: v1 scraped youtube.com search results through CORS
-   relays (they died or started demanding keys); v2/v3 raced
-   hardcoded Invidious + Piped mirrors (the hardcoded hosts died
-   one by one — inv.nadeko.net disabled its search API, yewtu.be
-   went behind a bot-check, pipedapi.kavin.rocks is down for long
-   stretches); v4 added live instance discovery, Bing-via-relays
-   and an optional paste-your-own YouTube Data API key box, which
-   the user rejected: asking every user to paste a key is too
-   complicated, it has to be seamless. v5 dropped the lookup for
-   YouTube's search-list embed (youtube.com/embed?listType=search)
-   — but YouTube deprecated listType=search on 15 November 2020
-   and the player now just shows "This video is unavailable", so
-   that approach is reverted here.
-   Current approach: a game with a saved YouTube link embeds that
-   exact video — no lookup. Otherwise the page races several
-   independent no-key sources in parallel for the query
-   "<Title> <Platform> longplay no commentary" (with a broader
-   "<Title> longplay" second pass) and embeds the first real
-   video ID any of them returns, saving it to the game so it
-   loads instantly from then on:
-     · YouTube itself, via the public Innertube endpoint
-       youtube.com's own web player uses (no personal key);
-     · Invidious and Piped mirrors, discovered live from the
-       projects' public instance lists — never a hardcoded set —
-       best-health first;
-     · Bing Videos and DuckDuckGo result pages fetched through
-       public CORS relays (those indexes carry youtube.com
-       watch links).
-   Every source reports back — answered, no results, failed, or
-   timed out — and the detail view shows that list, so a failure
-   names exactly which source answered or failed instead of
-   leaving a black box. "No video" is reported only when sources
-   actually answered and found nothing; if sources failed or
-   timed out, the state is "couldn't check", with a Try again
-   button, and failures are never cached. No API key is asked
-   for anywhere. */
+/* Playthrough videos — Cloudflare Worker lookup only.
+   A game with a saved YouTube link embeds that exact video — no
+   lookup. Otherwise the page asks the Cloudflare Worker:
+     https://game-rating-game-youtube.csaylor627.workers.dev/?q=<query>
+   where the query is "[Title] [Platform] longplay no commentary",
+   URL-encoded. The Worker returns JSON:
+     { status: "found", videoId, title }
+     { status: "none" }
+     { status: "failed", error }
+   A found videoId is embedded and saved onto the game as its
+   youtubeUrl, so it loads instantly from then on. A confirmed
+   "none" is cached for the session; failures are never cached and
+   show a Try again button. There is no other lookup path — no
+   Invidious, Piped, relay, DuckDuckGo or direct-browser waterfall. */
 function longplayQuery(title, consoleName) {
   return (title + " " + (consoleName || "") + " longplay no commentary").replace(/\s+/g, " ").trim();
 }
@@ -1323,197 +1299,11 @@ function youtubeSearchResultsUrl(title, consoleName) {
   return "https://www.youtube.com/results?search_query=" + encodeURIComponent(longplayQuery(title, consoleName));
 }
 
-const VIDEO_FETCH_MS = 6000;   // per-request timeout
-const VIDEO_PHASE_MS = 7000;   // per-query-phase deadline
-const videoSessionCache = new Map(); // query key -> { diag } for confirmed "no video" answers only
+const VIDEO_WORKER_URL = "https://game-rating-game-youtube.csaylor627.workers.dev/";
+const VIDEO_FETCH_MS = 15000;   // Worker request timeout
+const videoSessionCache = new Map(); // query key -> true, for confirmed "no video" answers only
 const videoInFlight = new Set();
 let videoTimer = null;
-
-/* A fetch that reports WHY it failed (timeout vs HTTP status vs
-   network), so the diagnostics can name it precisely. */
-async function fetchDiag(url, timeoutMs, opts) {
-  const ctrl = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
-  try {
-    const res = await fetch(url, Object.assign({}, opts || {}, { signal: ctrl.signal }));
-    if (!res.ok) return { ok: false, error: "HTTP " + res.status };
-    const body = opts && opts.json ? await res.json() : await res.text();
-    return { ok: true, body };
-  } catch {
-    return { ok: false, error: timedOut ? "timeout" : "network error" };
-  } finally { clearTimeout(timer); }
-}
-const VIDEO_RELAYS = [
-  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
-  (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
-  (u) => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
-];
-async function fetchTextViaRelays(url, timeoutMs) {
-  let lastError = "no relay answered";
-  for (const wrap of VIDEO_RELAYS) {
-    const r = await fetchDiag(wrap(url), timeoutMs, {});
-    if (r.ok && typeof r.body === "string" && r.body.length > 200) return { ok: true, text: r.body };
-    if (!r.ok) lastError = r.error;
-  }
-  return { ok: false, error: lastError };
-}
-/* Pull unique youtube.com watch IDs out of a results page. The
-   second pass decodes the page text so DuckDuckGo's redirect
-   links (uddg=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D…)
-   match too. */
-function idsFromPageText(text) {
-  const out = []; const seen = new Set();
-  const scan = (s) => {
-    const re = /watch\?v=([A-Za-z0-9_-]{11})/g; let m;
-    while ((m = re.exec(s)) !== null && out.length < 10) {
-      if (!seen.has(m[1])) { seen.add(m[1]); out.push({ id: m[1], title: "" }); }
-    }
-  };
-  scan(text);
-  try { scan(decodeURIComponent(text)); } catch { /* raw pass already ran */ }
-  return out;
-}
-
-/* --- the sources. Each run() resolves to { results: [{id, title}] }
-   on a healthy answer (possibly empty) or { error } on failure. --- */
-function innertubeSource(query) {
-  return { name: "YouTube (direct)", run: async () => {
-    const r = await fetchDiag("https://www.youtube.com/youtubei/v1/search?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false", VIDEO_FETCH_MS, {
-      method: "POST", json: true, headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ context: { client: { clientName: "WEB", clientVersion: "2.20240111.09.00", hl: "en", gl: "US" } }, query }),
-    });
-    if (!r.ok) return { error: r.error };
-    const out = [];
-    const walk = (node, depth) => {
-      if (!node || typeof node !== "object" || depth > 14 || out.length >= 12) return;
-      if (node.videoRenderer && typeof node.videoRenderer.videoId === "string") {
-        const runs = node.videoRenderer.title && node.videoRenderer.title.runs;
-        out.push({ id: node.videoRenderer.videoId, title: Array.isArray(runs) ? runs.map((x) => x.text || "").join("") : "" });
-      }
-      for (const k of Object.keys(node)) walk(node[k], depth + 1);
-    };
-    walk(r.body, 0);
-    return { results: out };
-  } };
-}
-let invidiousHostsPromise = null;
-function invidiousHosts() {
-  if (!invidiousHostsPromise) {
-    invidiousHostsPromise = (async () => {
-      const r = await fetchDiag("https://api.invidious.io/instances.json?sort_by=health,users", 4000, { json: true });
-      if (!r.ok || !Array.isArray(r.body)) return null;
-      const hosts = [];
-      for (const entry of r.body) {
-        const info = entry && entry[1];
-        if (info && info.api !== false && info.type === "https" && info.uri) hosts.push(info.uri.replace(/\/$/, ""));
-        if (hosts.length >= 3) break;
-      }
-      return hosts.length ? hosts : null;
-    })();
-  }
-  return invidiousHostsPromise;
-}
-let pipedHostsPromise = null;
-function pipedHosts() {
-  if (!pipedHostsPromise) {
-    pipedHostsPromise = (async () => {
-      const r = await fetchDiag("https://piped-instances.kavin.rocks/", 4000, { json: true });
-      if (!r.ok || !Array.isArray(r.body)) return null;
-      const hosts = [];
-      for (const entry of r.body) {
-        if (entry && entry.api_url) hosts.push(String(entry.api_url).replace(/\/$/, ""));
-        if (hosts.length >= 3) break;
-      }
-      return hosts.length ? hosts : null;
-    })();
-  }
-  return pipedHostsPromise;
-}
-function invidiousSource(host, query) {
-  return { name: "Invidious · " + host.replace(/^https?:\/\//, ""), run: async () => {
-    const r = await fetchDiag(host + "/api/v1/search?q=" + encodeURIComponent(query) + "&type=video", VIDEO_FETCH_MS, { json: true });
-    if (!r.ok) return { error: r.error };
-    if (!Array.isArray(r.body)) return { error: "unexpected reply" };
-    return { results: r.body.filter((v) => v && v.type === "video" && typeof v.videoId === "string").map((v) => ({ id: v.videoId, title: v.title || "" })) };
-  } };
-}
-function pipedSource(host, query) {
-  return { name: "Piped · " + host.replace(/^https?:\/\//, ""), run: async () => {
-    const r = await fetchDiag(host + "/search?q=" + encodeURIComponent(query) + "&filter=videos", VIDEO_FETCH_MS, { json: true });
-    if (!r.ok) return { error: r.error };
-    const items = r.body && Array.isArray(r.body.items) ? r.body.items : null;
-    if (!items) return { error: "unexpected reply" };
-    const out = [];
-    for (const it of items) {
-      const m = it && typeof it.url === "string" ? /[?&]v=([A-Za-z0-9_-]{11})/.exec(it.url) : null;
-      if (m) out.push({ id: m[1], title: it.title || "" });
-    }
-    return { results: out };
-  } };
-}
-function bingSource(query) {
-  return { name: "Bing Videos", run: async () => {
-    const r = await fetchTextViaRelays("https://www.bing.com/videos/search?q=" + encodeURIComponent(query), VIDEO_FETCH_MS);
-    if (!r.ok) return { error: r.error };
-    return { results: idsFromPageText(r.text) };
-  } };
-}
-function ddgSource(query) {
-  return { name: "DuckDuckGo", run: async () => {
-    const r = await fetchTextViaRelays("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query + " youtube"), VIDEO_FETCH_MS);
-    if (!r.ok) return { error: r.error };
-    return { results: idsFromPageText(r.text) };
-  } };
-}
-async function buildVideoSources(query) {
-  const [inv, pip] = await Promise.all([invidiousHosts(), pipedHosts()]);
-  const sources = [innertubeSource(query)];
-  if (inv) for (const h of inv) sources.push(invidiousSource(h, query));
-  else sources.push({ name: "Invidious", run: async () => ({ error: "instance list unreachable" }) });
-  if (pip) for (const h of pip) sources.push(pipedSource(h, query));
-  else sources.push({ name: "Piped", run: async () => ({ error: "instance list unreachable" }) });
-  sources.push(bingSource(query), ddgSource(query));
-  return sources;
-}
-
-/* Race one query's sources in parallel: the first source to return
-   a real result wins; every source's outcome lands in the diag
-   list either way. Sources still silent at the deadline are
-   recorded as timed out. */
-async function runVideoPhase(sources, onDiag) {
-  const diag = sources.map((s) => ({ name: s.name, status: "waiting", detail: "", ms: null }));
-  onDiag(diag);
-  let hit = null;
-  const started = Date.now();
-  const jobs = sources.map((s, i) => (async () => {
-    const t0 = Date.now();
-    let res;
-    try { res = await s.run(); } catch { res = { error: "failed" }; }
-    const ms = Date.now() - t0;
-    if (res && res.error) {
-      diag[i] = { name: s.name, status: res.error === "timeout" ? "timeout" : "error", detail: res.error, ms };
-    } else {
-      const results = (res && res.results) || [];
-      diag[i] = { name: s.name, status: results.length ? "ok" : "empty",
-        detail: results.length ? results.length + " result" + (results.length === 1 ? "" : "s") : "", ms };
-      if (results.length && !hit) {
-        const pick = results.find((v) => /longplay/i.test(v.title || "")) || results[0];
-        hit = { id: pick.id, source: s.name };
-      }
-    }
-    onDiag(diag);
-  })());
-  await new Promise((resolve) => {
-    const iv = setInterval(() => {
-      if (hit || diag.every((d) => d.status !== "waiting") || Date.now() - started >= VIDEO_PHASE_MS) { clearInterval(iv); resolve(); }
-    }, 100);
-  });
-  for (const d of diag) if (d.status === "waiting") { d.status = "timeout"; d.detail = "no answer in time"; }
-  onDiag(diag);
-  void jobs;
-  return { hit, diag };
-}
 
 function videoStatusInnerHtml() {
   const st = ui.detailFindState;
@@ -1532,7 +1322,7 @@ function videoStatusInnerHtml() {
   }
   return '<p class="dim" style="font-size:0.875rem;margin:0">No video yet.</p>';
 }
-function paintVideoDiag() {
+function paintVideoStatus() {
   const box = document.querySelector("[data-video-status]");
   if (box) box.innerHTML = videoStatusInnerHtml();
 }
@@ -1546,28 +1336,22 @@ function startVideoTimer() {
 }
 function stopVideoTimer() { if (videoTimer) { clearInterval(videoTimer); videoTimer = null; } }
 
-/* The lookup itself: exact query first, broader query second
-   (skipped when every source failed — it would fail the same way,
-   only slower). A found video is saved onto the game, so it is
-   never looked up again. A confirmed "no video" (sources answered
-   healthy and empty, nothing failed) is cached for the session;
-   failures are never cached, and Try again always re-runs. */
+/* The lookup itself: one call to the Cloudflare Worker with the
+   "[Title] [Platform] longplay no commentary" query. A found video
+   is saved onto the game, so it is never looked up again. */
 async function findLongplayVideo(id, force) {
   const g0 = gameById(id);
   if (!g0 || youtubeEmbedUrl(g0.youtubeUrl) || videoInFlight.has(id)) return;
   const platform = displayPlatform(g0.consoleName);
   const cacheKey = norm(g0.title) + "|" + norm(platform || "");
-  if (!force) {
-    const cached = videoSessionCache.get(cacheKey);
-    if (cached) {
-      if (ui.detailId === id) {
-        ui.detailFindState = "none";
-        ui.detailVideoDiag = cached.diag;
-        ui.detailVideoSource = null;
-        renderModal();
-      }
-      return;
+  if (!force && videoSessionCache.has(cacheKey)) {
+    if (ui.detailId === id) {
+      ui.detailFindState = "none";
+      ui.detailVideoDiag = [];
+      ui.detailVideoSource = null;
+      renderModal();
     }
+    return;
   }
   videoInFlight.add(id);
   try {
@@ -1580,42 +1364,48 @@ async function findLongplayVideo(id, force) {
       renderModal();
       startVideoTimer();
     }
-    const queries = [longplayQuery(g0.title, platform), (g0.title + " longplay").replace(/\s+/g, " ").trim()];
-    let lastDiag = [];
-    let sawHealthy = false, sawFailure = false;
-    for (let qi = 0; qi < queries.length; qi++) {
-      const sources = await buildVideoSources(queries[qi]);
+    const query = longplayQuery(g0.title, platform);
+    let data = null;
+    let failed = false;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), VIDEO_FETCH_MS);
+    try {
+      const res = await fetch(VIDEO_WORKER_URL + "?q=" + encodeURIComponent(query), { signal: ctrl.signal });
+      if (!res.ok) failed = true;
+      else data = await res.json();
+    } catch {
+      failed = true;
+    } finally { clearTimeout(timer); }
+
+    if (!failed && data && data.status === "found" && typeof data.videoId === "string" && /^[A-Za-z0-9_-]{11}$/.test(data.videoId)) {
+      patchGame(id, { youtubeUrl: "https://www.youtube.com/watch?v=" + data.videoId });
+      saveBoard();
       if (ui.detailId === id) {
-        ui.detailVideoPhase = "Finding a playthrough video…";
+        stopVideoTimer();
+        ui.detailFindState = "found";
+        ui.detailVideoSource = "worker";
+        ui.detailVideoDiag = [];
+        renderModal();
+        render();
       }
-      const phase = await runVideoPhase(sources, (diag) => {
-        if (ui.detailId === id) { ui.detailVideoDiag = diag; paintVideoDiag(); }
-      });
-      lastDiag = phase.diag;
-      if (phase.hit) {
-        patchGame(id, { youtubeUrl: "https://www.youtube.com/watch?v=" + phase.hit.id });
-        saveBoard();
-        if (ui.detailId === id) {
-          stopVideoTimer();
-          ui.detailFindState = "found";
-          ui.detailVideoSource = phase.hit.source;
-          ui.detailVideoDiag = phase.diag;
-          renderModal();
-          render();
-        }
-        return;
-      }
-      sawHealthy = sawHealthy || phase.diag.some((d) => d.status === "ok" || d.status === "empty");
-      sawFailure = sawFailure || phase.diag.some((d) => d.status === "error" || d.status === "timeout");
-      if (!sawHealthy) break;              // everything failed — a broader query fails the same way
-      if (ui.detailId !== id) return;      // user moved on — stop quietly
+      return;
     }
-    const none = sawHealthy && !sawFailure;
-    if (none) videoSessionCache.set(cacheKey, { diag: lastDiag });
+    if (!failed && data && data.status === "none") {
+      videoSessionCache.set(cacheKey, true);
+      if (ui.detailId === id) {
+        stopVideoTimer();
+        ui.detailFindState = "none";
+        ui.detailVideoDiag = [];
+        renderModal();
+      }
+      return;
+    }
+    /* Worker said "failed", or the request itself failed / timed
+       out / returned something unexpected — never cached. */
     if (ui.detailId === id) {
       stopVideoTimer();
-      ui.detailFindState = none ? "none" : "failed";
-      ui.detailVideoDiag = lastDiag;
+      ui.detailFindState = "failed";
+      ui.detailVideoDiag = [];
       renderModal();
     }
   } finally { videoInFlight.delete(id); }
@@ -2365,10 +2155,8 @@ async function maybeFindVideoOrCover() {
   if (!g) return;
   /* The video lookup and the cover repair run in parallel — a
      slow cover search never delays the video. A game with no
-     saved YouTube link gets the no-key lookup (findLongplayVideo:
-     YouTube direct, live-discovered Invidious/Piped mirrors,
-     Bing/DuckDuckGo via relays, with per-source diagnostics in
-     the detail view); a found video is saved onto the game. */
+     saved YouTube link gets the Cloudflare Worker lookup
+     (findLongplayVideo); a found video is saved onto the game. */
   if (!youtubeEmbedUrl(g.youtubeUrl)) {
     const force = ui.detailFindForce;
     ui.detailFindForce = false;
@@ -2502,10 +2290,9 @@ function detailModalHtml() {
   const round1Locked = board.state.lockedThrough >= 1;
   const embed = game.youtubeUrl ? youtubeEmbedUrl(game.youtubeUrl) : null;
   const currentPlatform = displayPlatform(game.consoleName);
-  /* A saved link embeds that exact video. Without one, the no-key
-     lookup (findLongplayVideo) races YouTube and the public
-     mirrors for a real video ID and saves what it finds onto the
-     game — the deprecated listType=search embed is gone. */
+  /* A saved link embeds that exact video. Without one, the
+     Cloudflare Worker lookup (findLongplayVideo) returns a real
+     video ID and saves what it finds onto the game. */
   const activeEmbed = embed;
   /* Only this game's own verified platforms are offered — never the
      master list of every console (that is how Stardew Valley could be
@@ -2538,10 +2325,8 @@ function detailModalHtml() {
       '<button type="button" data-action="detail-hide-video" style="background:none;border:none;text-decoration:underline;font-weight:600;min-height:2rem;padding:0">hide the video</button>.</p></div>';
   } else {
     /* No saved link: the art sits above the lookup status —
-       live progress and per-source diagnostics while searching,
-       and the settled verdict (with Try again) when it finishes.
-       paintVideoDiag() updates this block in place as sources
-       answer, without re-rendering the whole modal. */
+       "Finding a playthrough video…" while searching, and the
+       settled verdict (with Try again) when it finishes. */
     videoHtml = artHtml + '<div data-video-status style="margin-top:0.5rem">' + videoStatusInnerHtml() + "</div>";
   }
   let videoNote = "";
